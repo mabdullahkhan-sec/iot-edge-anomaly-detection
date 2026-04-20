@@ -1,0 +1,402 @@
+# === IDS Comparison: Isolation Forest vs RRCF (Colab-Ready, Dual-File Semi-Supervised) - Tailored for Uploaded Files) - Local File Reading & Detailed Attack Results ===
+# This script installs libraries, reads data from local folders (Benign and Attack),
+# trains models on Benign data, and evaluates performance on each individual attack file.
+
+# ---------------------------------------------------------------------
+# STEP 0: INSTALL LIBRARIES AND IMPORT COLAB UTILS
+# ---------------------------------------------------------------------
+print("⚙️ Installing required libraries...")
+# Install all dependencies silently
+!pip install --quiet pandas numpy scikit-learn matplotlib plotly rrcf
+print("✅ Installation complete.")
+
+import time
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import plotly.express as px
+from sklearn.ensemble import IsolationForest
+from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score
+from sklearn.preprocessing import MinMaxScaler
+import rrcf
+import warnings
+import os
+warnings.filterwarnings("ignore") # Suppress minor warnings for clean Colab output
+
+
+# --- RRCF Scoring Function ---
+def get_rrcf_anomaly_scores(X: pd.DataFrame, n_trees: int, sample_size: int) -> np.ndarray:
+    """Computes the robust anomaly score (Co-Displacement) using the RRCF method."""
+    X_data = X.values
+    n = X_data.shape[0]
+    index = np.arange(n)
+    avg_codisplacements = np.zeros(n)
+    sample_counts = np.zeros(n)
+
+    # Build and score with multiple trees
+    for _ in range(n_trees):
+        # Sample points without replacement
+        ixs = np.random.choice(n, size=sample_size, replace=False)
+        tree = rrcf.RCTree(X_data[ixs, :], index_labels=index[ixs])
+        tree_codisp = {ix: tree.codisp(ix) for ix in tree.leaves}
+
+        for i in ixs:
+            avg_codisplacements[i] += tree_codisp.get(i, 0.0)
+            sample_counts[i] += 1
+
+    # Calculate average Co-Displacement, handling division by zero safely
+    final_scores = np.divide(avg_codisplacements, sample_counts,
+                             out=np.zeros_like(avg_codisplacements, dtype=float), where=sample_counts!=0)
+    return final_scores
+
+
+# --- File Loading Helper Function for Local Paths ---
+def load_data_from_folder(folder_path, numerical_cols, max_rows):
+    """Loads data from all CSV files in a given folder and returns a list of DataFrames."""
+    all_files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if f.endswith('.csv')]
+    if not all_files:
+        print(f"❌ ERROR: No CSV files found in '{folder_path}'")
+        return None
+
+    list_df = []
+    for filename in all_files:
+        df = clean_and_load_df(filename, numerical_cols, max_rows)
+        if df is not None:
+            list_df.append((os.path.basename(filename), df)) # Store filename and DataFrame
+
+    if not list_df:
+        print(f"❌ ERROR: No valid data loaded from '{folder_path}'")
+        return None
+
+    print(f"✅ Successfully loaded data from '{folder_path}'. Found {len(list_df)} files.")
+    return list_df
+
+
+# --- Data Cleaner Helper Function ---
+def clean_and_load_df(filename, numerical_cols, max_rows):
+    """Loads, cleans, and filters the DataFrame."""
+    if filename is None:
+        print("Skipping data loading: No filename provided.")
+        return None
+    print(f"📥 Loading first {max_rows:,} rows from '{filename}'...")
+    df = None # Initialize df to None
+    try:
+        df = pd.read_csv(filename, nrows=max_rows, low_memory=False)
+        print(f"Initial rows loaded: {len(df)}")
+    except FileNotFoundError:
+        print(f"❌ ERROR: File not found: {filename}")
+        return None
+    except pd.errors.EmptyDataError:
+        print(f"❌ ERROR: File is empty: {filename}")
+        return None
+    except Exception as e:
+        print(f"❌ ERROR loading or reading file '{filename}': {e}")
+        return None
+
+    # Select only numerical columns that exist in the DataFrame
+    existing_numerical_cols = [col for col in numerical_cols if col in df.columns]
+    df_numerical = df[existing_numerical_cols].copy()
+
+    # Clean numerical columns: Replace infinite/large values with NaN
+    for col in existing_numerical_cols:
+        df_numerical[col].replace([np.inf, -np.inf], np.nan, inplace=True)
+
+    # Drop rows with NaNs in numerical columns
+    rows_before_cleaning = len(df_numerical)
+    df_cleaned_numerical = df_numerical.dropna(subset=existing_numerical_cols).copy()
+    rows_after_cleaning = len(df_cleaned_numerical)
+
+    print(f"✅ Data Loaded & Cleaned from '{filename}': {rows_after_cleaning:,} rows remain (dropped {rows_before_cleaning - rows_after_cleaning:,} rows with NaNs).")
+
+    # If 'Protocol' column exists in the original data, keep it and merge back
+    if 'Protocol' in df.columns:
+        df_cleaned_protocol = df.loc[df_cleaned_numerical.index, ['Protocol']].copy()
+        df_cleaned = pd.concat([df_cleaned_numerical, df_cleaned_protocol], axis=1)
+    else:
+        df_cleaned = df_cleaned_numerical
+
+    return df_cleaned
+
+
+# ---------- STEP 1: Local File Loading ----------
+MAX_ROWS = 100_000 # Limit rows for faster execution
+
+# Features identified from the flow data structure (confirmed from uploaded files)
+numerical_cols = [
+    'Flow Duration', 'Total Fwd Packet', 'Total Bwd packets',
+    'Total Length of Fwd Packet', 'Total Length of Bwd Packet',
+    'Fwd Packet Length Max', 'Bwd Packet Length Max', 'Fwd Header Length',
+    'Bwd Header Length', 'Packet Length Std'
+]
+
+# Define Google Drive folder paths (Update these to the actual paths in your Google Drive)
+benign_folder = '/content/drive/MyDrive/Benign File'
+attack_folder = '/content/drive/MyDrive/Attack folder'
+
+
+# Load data from local folders
+print(f"\n------------------------------------------------------------")
+print(f"📂 Loading data from Google Drive:")
+
+# Initialize metrics_calculated flag
+metrics_calculated = False
+
+# ---------- STEP 2: Data Cleaning, Labeling, and Combination ----------
+
+# Load and clean benign data for training (from all files in the folder)
+print(f"\n📂 Loading benign data from '{benign_folder}'...")
+list_df_benign = load_data_from_folder(benign_folder, numerical_cols, MAX_ROWS)
+
+df_benign_train = None
+if list_df_benign:
+    # Concatenate all benign dataframes into a single dataframe for training
+    df_benign_train = pd.concat([df for _, df in list_df_benign], ignore_index=True)
+    print(f"✅ Combined {len(list_df_benign)} benign files into a single training DataFrame with {len(df_benign_train):,} rows.")
+else:
+    print("❌ No benign files loaded or valid data found in benign folder.")
+
+# Load and clean attack data from the folder (returns a list of dataframes)
+list_df_attack = load_data_from_folder(attack_folder, numerical_cols, MAX_ROWS)
+
+# Placeholder for all results across different contamination values
+all_attack_results = []
+
+# Check if benign training data was loaded successfully before proceeding
+if df_benign_train is not None and not df_benign_train.empty:
+    # Scale benign data for training
+    scaler = MinMaxScaler()
+    X_train_scaled = scaler.fit_transform(df_benign_train[numerical_cols])
+    X_train_scaled_df = pd.DataFrame(X_train_scaled, columns=numerical_cols, index=df_benign_train.index)
+
+    # --- Define contamination values to test ---
+    contamination_values_to_test = [0.01, 0.05, 0.10]
+
+    for current_contamination in contamination_values_to_test:
+        print(f"\n==========================================================")
+        print(f"🧪 Running analysis with CONTAMINATION = {current_contamination * 100:.0f}%")
+        print(f"==========================================================")
+
+        # ---------- STEP 3: RRCF and IF Model Training ----------
+        CONTAMINATION = current_contamination # Use current contamination value
+        N_TREES = 50
+        SAMPLE_SIZE = 256
+
+        # --- Isolation Forest (Trained on Benign Data Only) ---
+        print("\n⚙️ Training Isolation Forest on BENIGN data...")
+        if_start_time = time.time()
+        if_model = IsolationForest(contamination=CONTAMINATION, random_state=42, n_jobs=-1)
+        if_model.fit(X_train_scaled_df) # Train only on benign
+        if_time = time.time() - if_start_time
+        print(f"✅ Isolation Forest Training Time (s): {if_time:.4f}")
+
+        # --- RRCF (Trained on Benign Data Only) ---
+        print("⚙️ Training Robust Random Cut Forest (RRCF) on BENIGN data...")
+        rrcf_start_time = time.time()
+        rrcf_scores_train = get_rrcf_anomaly_scores(df_benign_train[numerical_cols], N_TREES, SAMPLE_SIZE)
+        rrcf_time = time.time() - rrcf_start_time
+        print(f"✅ RRCF Training Time (s): {rrcf_time:.4f}")
+
+        # Thresholding for RRCF: Calculate threshold based *only* on the Benign scores
+        rrcf_threshold = np.percentile(rrcf_scores_train, (1 - CONTAMINATION) * 100)
+        print(f"Calculated RRCF Threshold (based on Benign data): {rrcf_threshold:.4f}")
+
+
+        # ---------- STEP 4: Evaluation on Each Attack File ----------
+        if list_df_attack is not None and len(list_df_attack) > 0:
+            print(f"\n📊 Evaluating models on {len(list_df_attack)} attack files...")
+
+            current_run_results = [] # Store results for this contamination value
+
+            for attack_filename, df_attack_file in list_df_attack:
+                if not df_attack_file.empty:
+                    print(f"\nEvaluating: {attack_filename}")
+
+                    df_attack_file['True_Label'] = 'Intrusion'
+                    Y_true_attack = df_attack_file['True_Label'].map({'Normal': 0, 'Intrusion': 1})
+
+                    X_attack_scaled = scaler.transform(df_attack_file[numerical_cols])
+                    X_attack_scaled_df = pd.DataFrame(X_attack_scaled, columns=numerical_cols, index=df_attack_file.index)
+
+                    # --- IF Prediction on Attack File ---
+                    if_eval_start_time = time.time()
+                    df_attack_file['IF_RawScore'] = if_model.predict(X_attack_scaled_df)
+                    df_attack_file['IF_Pred'] = df_attack_file['IF_RawScore'].map({1: 'Normal', -1: 'Intrusion'})
+                    Y_pred_if_attack = df_attack_file['IF_Pred'].map({'Normal': 0, 'Intrusion': 1})
+                    if_eval_time = time.time() - if_eval_start_time
+
+                    # --- RRCF Prediction on Attack File ---
+                    rrcf_eval_start_time = time.time()
+                    rrcf_scores_attack = get_rrcf_anomaly_scores(df_attack_file[numerical_cols], N_TREES, SAMPLE_SIZE)
+                    df_attack_file['RRCF_Pred'] = np.where(rrcf_scores_attack > rrcf_threshold, 'Intrusion', 'Normal')
+                    Y_pred_rrcf_attack = df_attack_file['RRCF_Pred'].map({'Normal': 0, 'Intrusion': 1})
+                    rrcf_eval_time = time.time() - rrcf_eval_start_time
+
+                    # --- Calculate Metrics for this Attack File ---
+                    m_if_attack = {
+                        'File': attack_filename,
+                        'Algorithm': 'Isolation Forest',
+                        'Contamination': current_contamination,
+                        'Precision': precision_score(Y_true_attack, Y_pred_if_attack, zero_division=0),
+                        'Recall': recall_score(Y_true_attack, Y_pred_if_attack, zero_division=0),
+                        'F1': f1_score(Y_true_attack, Y_pred_if_attack, zero_division=0),
+                        'Accuracy': accuracy_score(Y_true_attack, Y_pred_if_attack),
+                        'Evaluation Time (s)': if_eval_time
+                    }
+
+                    m_rrcf_attack = {
+                        'File': attack_filename,
+                        'Algorithm': 'RRCF',
+                        'Contamination': current_contamination,
+                        'Precision': precision_score(Y_true_attack, Y_pred_rrcf_attack, zero_division=0),
+                        'Recall': recall_score(Y_true_attack, Y_pred_rrcf_attack, zero_division=0),
+                        'F1': f1_score(Y_true_attack, Y_pred_rrcf_attack, zero_division=0),
+                        'Accuracy': accuracy_score(Y_true_attack, Y_pred_rrcf_attack),
+                         'Evaluation Time (s)': rrcf_eval_time
+                    }
+
+                    current_run_results.append(m_if_attack)
+                    current_run_results.append(m_rrcf_attack)
+                else:
+                    print(f"❌ Skipping empty attack file: {attack_filename}")
+
+            # Add results of this contamination run to the overall list
+            all_attack_results.extend(current_run_results)
+
+        else:
+            print(f"\n❌ No attack files loaded or attack data loading failed for CONTAMINATION={current_contamination}.")
+            metrics_calculated = False
+
+else:
+    print("\n❌ Benign training data loading failed or is empty. Cannot train models or proceed with analysis.")
+    metrics_calculated = False # Set to False if benign data loading fails
+
+# Convert all collected results to DataFrame and display
+if all_attack_results:
+    attack_results_df = pd.DataFrame(all_attack_results)
+    print("\n--- CONSOLIDATED ATTACK FILE METRICS SUMMARY ACROSS ALL CONTAMINATION VALUES ---")
+    display(attack_results_df)
+    metrics_calculated = True
+else:
+    print("\n❌ No results generated for any contamination value.")
+    metrics_calculated = False
+
+
+# ---------- STEP 5: Summarize and Print Training Results (Optional, based on user request) ----------
+print("\n--- TRAINING SUMMARY (from last run) ---")
+if 'df_benign_train' in locals() and df_benign_train is not None:
+    print(f"Total Benign rows used for training: {len(df_benign_train):,}")
+else:
+    print("Total Benign rows used for training: Data not loaded")
+
+if 'if_time' in locals():
+    print(f"Isolation Forest Training Time (s): {if_time:.4f}")
+if 'rrcf_time' in locals():
+    print(f"RRCF Training Time (s): {rrcf_time:.4f}")
+
+
+print("\n--- ANALYSIS COMPLETE ---")
+print("The models were trained on the benign data and evaluated against each individual attack file for multiple contamination values.")
+
+# ---------- STEP 6: Visualization (Updated for readability and contamination values) ----------
+
+# Filter for Isolation Forest metrics
+if_metrics_df = attack_results_df[attack_results_df['Algorithm'] == 'Isolation Forest'].copy()
+
+# Remove '.csv' extension from file names for cleaner x-axis labels in both plots
+if_metrics_df['File'] = if_metrics_df['File'].str.replace('.pcap_Flow.csv', '', regex=False)
+
+# Convert Contamination to string for categorical faceting
+if_metrics_df['Contamination'] = if_metrics_df['Contamination'].astype(str)
+
+# --- Plot 1: Performance Metrics (Recall, F1, Accuracy) for Isolation Forest ---
+if_perf_metrics_melted = if_metrics_df.melt(id_vars=['File', 'Algorithm', 'Contamination'], 
+                                            value_vars=['Recall', 'F1', 'Accuracy'],
+                                            var_name='Metric', value_name='Value')
+
+fig_if_perf = px.bar(if_perf_metrics_melted, x='File', y='Value', color='Metric', 
+                     barmode='group', facet_col='Contamination', # Facet by contamination
+                     title='Isolation Forest: Performance Metrics (Recall, F1, Accuracy) per Attack File by Contamination',
+                     labels={'Value': 'Metric Score', 'File': 'Attack File'})
+
+fig_if_perf.update_layout(xaxis_tickangle=-45)
+fig_if_perf.show()
+
+# --- Plot 2: Evaluation Time for Isolation Forest ---
+fig_if_time = px.bar(if_metrics_df, x='File', y='Evaluation Time (s)', facet_col='Contamination',
+                     title='Isolation Forest: Evaluation Time per Attack File by Contamination',
+                     labels={'Evaluation Time (s)': 'Time (seconds)', 'File': 'Attack File'},
+                     color_discrete_sequence=['purple'])
+
+fig_if_time.update_layout(xaxis_tickangle=-45)
+fig_if_time.show()
+
+# Filter for RRCF metrics
+rrcf_metrics_df = attack_results_df[attack_results_df['Algorithm'] == 'RRCF'].copy()
+
+# Remove '.csv' extension from file names for cleaner x-axis labels in both plots
+rrcf_metrics_df['File'] = rrcf_metrics_df['File'].str.replace('.csv', '', regex=False)
+
+# Convert Contamination to string for categorical faceting
+rrcf_metrics_df['Contamination'] = rrcf_metrics_df['Contamination'].astype(str)
+
+# --- Plot 1: Performance Metrics (Recall, F1, Accuracy) for RRCF ---
+rrcf_perf_metrics_melted = rrcf_metrics_df.melt(id_vars=['File', 'Algorithm', 'Contamination'], 
+                                              value_vars=['Recall', 'F1', 'Accuracy'],
+                                              var_name='Metric', value_name='Value')
+
+fig_rrcf_perf = px.bar(rrcf_perf_metrics_melted, x='File', y='Value', color='Metric', 
+                       barmode='group', facet_col='Contamination',
+                       title='RRCF: Performance Metrics (Recall, F1, Accuracy) per Attack File by Contamination',
+                       labels={'Value': 'Metric Score', 'File': 'Attack File'})
+
+fig_rrcf_perf.update_layout(xaxis_tickangle=-45)
+fig_rrcf_perf.show()
+
+# --- Plot 2: Evaluation Time for RRCF ---
+fig_rrcf_time = px.bar(rrcf_metrics_df, x='File', y='Evaluation Time (s)', facet_col='Contamination',
+                       title='RRCF: Evaluation Time per Attack File by Contamination',
+                       labels={'Evaluation Time (s)': 'Time (seconds)', 'File': 'Attack File'},
+                       color_discrete_sequence=['green'])
+
+fig_rrcf_time.update_layout(xaxis_tickangle=-45)
+fig_rrcf_time.show()
+
+import plotly.io as pio
+from google.colab import files
+
+# --- Save Tabular Results to CSV ---
+output_csv_filename = 'ids_comparison_results.csv'
+attack_results_df.to_csv(output_csv_filename, index=False)
+print(f"✅ Tabular results successfully saved to '{output_csv_filename}'")
+
+# --- Save Graph Results to HTML Files ---
+print("\nSaving interactive plots as HTML files...")
+
+# 1. Isolation Forest Performance Metrics
+if_perf_html_filename = 'if_performance_metrics.html'
+pio.write_html(fig_if_perf, file=if_perf_html_filename, auto_open=False)
+print(f"✅ Isolation Forest Performance Metrics plot saved as '{if_perf_html_filename}'")
+
+# 2. Isolation Forest Evaluation Time
+if_time_html_filename = 'if_evaluation_time.html'
+pio.write_html(fig_if_time, file=if_time_html_filename, auto_open=False)
+print(f"✅ Isolation Forest Evaluation Time plot saved as '{if_time_html_filename}'")
+
+# 3. RRCF Performance Metrics
+rrcf_perf_html_filename = 'rrcf_performance_metrics.html'
+pio.write_html(fig_rrcf_perf, file=rrcf_perf_html_filename, auto_open=False)
+print(f"✅ RRCF Performance Metrics plot saved as '{rrcf_perf_html_filename}'")
+
+# 4. RRCF Evaluation Time
+rrcf_time_html_filename = 'rrcf_evaluation_time.html'
+pio.write_html(fig_rrcf_time, file=rrcf_time_html_filename, auto_open=False)
+print(f"✅ RRCF Evaluation Time plot saved as '{rrcf_time_html_filename}'")
+
+
+print("\nProviding download links for all generated files:")
+# --- Provide Download Links ---
+files.download(output_csv_filename)
+files.download(if_perf_html_filename)
+files.download(if_time_html_filename)
+files.download(rrcf_perf_html_filename)
+files.download(rrcf_time_html_filename)
